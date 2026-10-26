@@ -7,11 +7,17 @@
 
 use bytes::Bytes;
 
+/// The largest UDP payload over IPv4: a 65,535-byte packet minus 20 bytes of IP header and 8 of
+/// UDP header. A GSO batch is handed to the kernel as one datagram, so it must fit too; the kernel
+/// rejects a larger one with `EMSGSIZE`.
+const MAX_GSO_BYTES: usize = 65_507;
+
 /// Groups consecutive datagrams into Generic Segmentation Offload (GSO) batches:
 /// each yielded slice is a run of **equal-length** datagrams, at most
 /// `max_segments` long. A length change ends the current batch (GSO transmits a
-/// run of one segment size). With `max_segments <= 1` every datagram is its own
-/// batch — the no-offload path.
+/// run of one segment size). A batch also never exceeds [`MAX_GSO_BYTES`] in total,
+/// so with large datagrams it holds fewer than `max_segments`. With `max_segments <= 1`
+/// every datagram is its own batch — the no-offload path.
 pub(crate) fn gso_batches(
     datagrams: &[Bytes],
     max_segments: usize,
@@ -23,6 +29,7 @@ pub(crate) fn gso_batches(
             return None;
         }
         let seg_len = datagrams[start].len();
+        let cap = cap.min((MAX_GSO_BYTES / seg_len.max(1)).max(1));
         let mut end = start + 1;
         while end < datagrams.len() && end - start < cap && datagrams[end].len() == seg_len {
             end += 1;
@@ -84,6 +91,17 @@ mod tests {
         let datagrams: Vec<Bytes> = (0..10).map(|i| dg(1200, i)).collect();
         let sizes: Vec<usize> = gso_batches(&datagrams, 4).map(<[Bytes]>::len).collect();
         assert_eq!(sizes, vec![4, 4, 2], "batches are capped at 4");
+    }
+
+    #[test]
+    fn gso_caps_each_batch_at_one_udp_datagram() {
+        // 64 full-size SRT packets would be 85,248 bytes: over the UDP limit.
+        let datagrams: Vec<Bytes> = (0..100).map(|i| dg(1332, i)).collect();
+        let sizes: Vec<usize> = gso_batches(&datagrams, 64).map(<[Bytes]>::len).collect();
+        assert_eq!(sizes, vec![49, 49, 2]);
+        for batch in gso_batches(&datagrams, 64) {
+            assert!(batch.iter().map(Bytes::len).sum::<usize>() <= MAX_GSO_BYTES);
+        }
     }
 
     #[test]
