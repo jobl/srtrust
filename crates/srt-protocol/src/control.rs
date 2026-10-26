@@ -203,12 +203,15 @@ impl ControlBody {
     /// Appends this body's CIF to `out`.
     pub(crate) fn encode_cif(&self, out: &mut BytesMut) {
         match self {
-            // No CIF (the type-specific field carries any payload).
+            // No CIF in the spec (the type-specific field carries any payload), but sent with 4
+            // zero bytes, as libsrt does (`CPacket::pack`, `m_extra_pad`): libsrt 1.5.7 drops
+            // control packets whose payload is empty or not 4-byte aligned (commit fcae57145),
+            // which made it ignore our shutdown, ACKACK and keepalive packets.
             ControlBody::Keepalive
             | ControlBody::Shutdown
             | ControlBody::CongestionWarning
             | ControlBody::AckAck { .. }
-            | ControlBody::PeerError { .. } => {}
+            | ControlBody::PeerError { .. } => out.put_u32(0),
             ControlBody::DropReq { first, last, .. } => {
                 out.put_u32(first.value());
                 out.put_u32(last.value());
