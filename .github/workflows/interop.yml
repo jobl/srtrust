@@ -1,0 +1,63 @@
+# Interop against libsrt. The tests skip (and pass) when libsrt is missing, so this
+# job builds it where the tests look (~/dev/srt/_build) and fails on any skip.
+name: Interop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  libsrt:
+    name: libsrt ${{ matrix.libsrt }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        libsrt: [v1.5.5, v1.5.7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache libsrt
+        id: libsrt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/dev/srt
+          key: libsrt-${{ matrix.libsrt }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build libsrt
+        if: steps.libsrt-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake libssl-dev
+          git clone --depth 1 --branch ${{ matrix.libsrt }} https://github.com/Haivision/srt.git ~/dev/srt
+          cmake -S ~/dev/srt -B ~/dev/srt/_build -DCMAKE_BUILD_TYPE=Release -DENABLE_APPS=ON
+          cmake --build ~/dev/srt/_build -j "$(nproc)"
+      # interop.rs looks only on PATH; the other tests also find ~/dev/srt/_build.
+      - name: Put libsrt on PATH
+        run: echo "$HOME/dev/srt/_build" >> "$GITHUB_PATH"
+      - name: Check libsrt
+        env:
+          VERSION: ${{ matrix.libsrt }}
+        run: |
+          srt-live-transmit -version 2>&1 | grep -F "version: ${VERSION#v}"
+      # The burst tests need more socket buffer than the 208 KB default.
+      - name: Raise socket buffer limits
+        run: |
+          sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432
+          sudo sysctl -w net.core.rmem_default=8388608 net.core.wmem_default=8388608
+      # Release: pacing fidelity is asserted in release builds only.
+      - name: Interop tests
+        run: |
+          set -o pipefail
+          timeout 1200 cargo test --release --no-fail-fast -p srt \
+            --test interop --test interop_edge --test interop_intense --test wan \
+            -- --nocapture --test-threads=1 2>&1 | tee interop.log
+      - name: Fail on skipped tests
+        run: |
+          if grep -n "SKIP" interop.log; then
+            echo "::error::interop tests skipped; libsrt was not found"
+            exit 1
+          fi
