@@ -190,34 +190,41 @@ fn reorder_tolerance_adapts_to_a_jittery_link() {
         loss: 0.0,
         jitter: Duration::from_millis(20),
     };
-    let mut pair = connected(jittery, jittery, 21);
+    // Summed over seeds: with one seed the adapted count
+    // is a handful of NAKs, so one more or fewer from any timing change (such
+    // as the sender following the receiver's RTT) flipped the verdict.
+    let (mut learned_naks, mut adapted_naks) = (0, 0);
+    for seed in 1..=20 {
+        let mut pair = connected(jittery, jittery, seed);
 
-    // Learning phase: the receiver may NAK while it discovers the reorder depth.
-    for i in 0..150u8 {
-        pair.caller_send(&payload(i, 60));
-        pair.run_for(1_000);
+        // Learning phase: the receiver may NAK while it discovers the reorder depth.
+        for i in 0..150u8 {
+            pair.caller_send(&payload(i, 60));
+            pair.run_for(1_000);
+        }
+        pair.run_for(500_000); // settle: everything delivered, no gaps outstanding
+        let learned = pair.accepted_naks();
+
+        // Adapted phase: same jitter, zero loss — no more spurious NAKs.
+        for i in 150..=255u8 {
+            pair.caller_send(&payload(i, 60));
+            pair.run_for(1_000);
+        }
+        // Long enough for the tail to clear the 1 s TSBPD latency and play out.
+        pair.run_for(1_500_000);
+
+        assert_eq!(
+            pair.accepted_received().len(),
+            256,
+            "everything is delivered on the lossless link (seed {seed})"
+        );
+        learned_naks += learned;
+        adapted_naks += pair.accepted_naks() - learned;
     }
-    pair.run_for(500_000); // settle: everything delivered, no gaps outstanding
-    let learned_naks = pair.accepted_naks();
-
-    // Adapted phase: same jitter, zero loss — no more spurious NAKs.
-    for i in 150..=255u8 {
-        pair.caller_send(&payload(i, 60));
-        pair.run_for(1_000);
-    }
-    // Long enough for the tail to clear the 1 s TSBPD latency and play out.
-    pair.run_for(1_500_000);
-
-    assert_eq!(
-        pair.accepted_received().len(),
-        256,
-        "everything is delivered on the lossless link"
-    );
     // A residual trickle is allowed: the tolerance decays on sustained order
     // (so it must occasionally re-learn) and a never-before-seen reorder depth
     // can still first appear here. What must be gone is the steady spurious
     // NAK-ing a *fixed* tolerance produces on every deep reorder.
-    let adapted_naks = pair.accepted_naks() - learned_naks;
     assert!(
         adapted_naks <= learned_naks / 4,
         "once adapted, spurious NAKs nearly vanish: {adapted_naks} new \

@@ -314,6 +314,22 @@ impl Connection {
         {
             self.peer_avail_window = avail_buffer_size;
         }
+        // Small and full ACKs carry the receiver's RTT, which a sender has no other way to
+        // follow (libsrt `processCtrlAck`).
+        if let AckCif::Small {
+            rtt, rtt_variance, ..
+        }
+        | AckCif::Full {
+            rtt, rtt_variance, ..
+        } = ack.cif
+        {
+            let bidirectional = self.stats.packets_received > 0;
+            self.rtt.adopt_peer_estimate(
+                Duration::from_micros(u64::from(rtt)),
+                Duration::from_micros(u64::from(rtt_variance)),
+                bidirectional,
+            );
+        }
         // Shed any now-too-late unacknowledged packets (send-side TLPKTDROP), so
         // the steady ACK cadence bounds how long a dead packet lingers.
         self.drop_too_late(now);

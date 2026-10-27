@@ -73,6 +73,34 @@ impl RttEstimator {
         self.var = Duration::from_micros(new_var);
     }
 
+    /// Takes the receiver's smoothed RTT and variance from an ACK, as libsrt's sender does
+    /// (`processCtrlAck`). Only the side sending ACKs gets ACKACKs to measure from, so a sender
+    /// that receives no data has no samples of its own after the first. Values still at the
+    /// spec's initial ones carry no measurement and don't count as the first. After the first, a
+    /// sender that also receives data (`bidirectional`) blends them into its own estimate; one
+    /// that only sends takes them as they are.
+    pub(crate) fn adopt_peer_estimate(
+        &mut self,
+        rtt: Duration,
+        var: Duration,
+        bidirectional: bool,
+    ) {
+        let initial = rtt == INITIAL_RTT || var == INITIAL_RTT_VAR;
+        if !self.sampled {
+            if rtt != INITIAL_RTT && var != INITIAL_RTT_VAR {
+                (self.rtt, self.var, self.sampled) = (rtt, var, true);
+            }
+        } else if !bidirectional {
+            (self.rtt, self.var) = (rtt, var);
+        } else if !initial {
+            // libsrt blends the peer's (already smoothed) RTT in like a sample of its own.
+            let (old_rtt, old_var, peer) = (micros(self.rtt), micros(self.var), micros(rtt));
+            self.var =
+                Duration::from_micros((old_var.saturating_mul(3) + old_rtt.abs_diff(peer)) / 4);
+            self.rtt = Duration::from_micros((old_rtt.saturating_mul(7) + peer) / 8);
+        }
+    }
+
     /// The retransmission timeout derived from the estimate: `RTT + 4·RTTVar`
     /// (the base interval SRT uses for NAK/EXP timing; floors are applied by the
     /// connection layer).
@@ -89,6 +117,28 @@ fn micros(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sender_takes_the_peers_rtt() {
+        let mut est = RttEstimator::new();
+        // Initial values carry no measurement.
+        est.adopt_peer_estimate(INITIAL_RTT, INITIAL_RTT_VAR, false);
+        assert_eq!((est.rtt(), est.var()), (INITIAL_RTT, INITIAL_RTT_VAR));
+        est.adopt_peer_estimate(ms(40), ms(5), false);
+        assert_eq!((est.rtt(), est.var()), (ms(40), ms(5)));
+        // Sending only: the peer's values as they are.
+        est.adopt_peer_estimate(ms(120), ms(10), false);
+        assert_eq!((est.rtt(), est.var()), (ms(120), ms(10)));
+    }
+
+    #[test]
+    fn a_sender_that_also_receives_blends_the_peers_rtt_in() {
+        let mut est = RttEstimator::new();
+        est.sample(ms(40));
+        est.adopt_peer_estimate(ms(120), ms(10), true);
+        assert_eq!(est.rtt(), ms(50), "7/8 of 40 plus 1/8 of 120");
+        assert_eq!(est.var(), ms(35), "3/4 of 20 plus 1/4 of |40 - 120|");
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
